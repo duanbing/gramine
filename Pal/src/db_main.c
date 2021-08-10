@@ -64,43 +64,154 @@ static void load_libraries(void) {
     }
 }
 
+/* Finds `loader.env.{key}` in the manifest and returns its value in `out_val`/`out_passthrough`.
+ * Recognizes several formats:
+ *   - `loader.env.{key} = "val"`
+ *   - `loader.env.{key} = { value = "val" }`
+ *   - `loader.env.{key} = { passthrough = true|false }`
+ *
+ * If `loader.env.{key}` doesn't exist, then returns 0 and `*out_exists = false`. If the key exists,
+ * then `*out_exists = true` and the corresponding `*out_val` or `*out_passthrough` is set.
+ *
+ * For any other format, returns negative error code. The caller is responsible to free `out_val`.
+ */
+static int get_env_value_from_manifest(toml_table_t* toml_envs, const char* key, bool* out_exists,
+                                       char** out_val, bool* out_passthrough) {
+    int ret;
+
+    toml_table_t* toml_env_table = toml_table_in(toml_envs, key);
+    if (!toml_env_table) {
+        /* not table like `loader.env.key = {...}`, must be string like `loader.env.key = "val"` */
+        toml_raw_t toml_env_val_raw = toml_raw_in(toml_envs, key);
+        if (!toml_env_val_raw) {
+            *out_val = NULL;
+            *out_passthrough = false;
+            *out_exists = false;
+            return 0;
+        }
+
+        if (!out_val)
+            return -PAL_ERROR_INVAL;
+
+        ret = toml_rtos(toml_env_val_raw, out_val);
+        if (ret < 0)
+            return -PAL_ERROR_NOMEM;
+
+        *out_passthrough = false;
+        *out_exists = true;
+        return 0;
+    }
+
+    toml_raw_t toml_passthrough_raw = toml_raw_in(toml_env_table, "passthrough");
+    toml_raw_t toml_value_raw = toml_raw_in(toml_env_table, "value");
+
+    if (toml_passthrough_raw && toml_value_raw) {
+        /* disallow `loader.env.key = { passthrough = true, value = "val" }` */
+        return -PAL_ERROR_INVAL;
+    }
+
+    if (!toml_passthrough_raw) {
+        /* not passthrough like `loader.env.key = { passthrough = true }`, must be value-table like
+         * `loader.env.key = { value = "val" }` */
+        if (!toml_value_raw || !out_val)
+            return -PAL_ERROR_INVAL;
+
+        ret = toml_rtos(toml_value_raw, out_val);
+        if (ret < 0)
+            return -PAL_ERROR_NOMEM;
+
+        *out_passthrough = false;
+        *out_exists = true;
+        return 0;
+    }
+
+    /* at this point, it must be `loader.env.key = { passthrough = true|false }`*/
+    if (!out_passthrough)
+        return -PAL_ERROR_INVAL;
+
+    int passthrough_int;
+    ret = toml_rtob(toml_passthrough_raw, &passthrough_int);
+    if (ret < 0)
+        return -PAL_ERROR_INVAL;
+
+    *out_passthrough = !!passthrough_int;
+    *out_val = NULL;
+    *out_exists = true;
+    return 0;
+}
+
 /* This function leaks memory on failure (and this is non-trivial to fix), but the assumption is
  * that its failure finishes the execution of the whole process right away. */
-static int insert_envs_from_manifest(const char*** envpp) {
-    int ret;
-    assert(envpp);
+static int deep_copy_envs(bool propagate, const char** envp, const char*** out_envp) {
+    if (!propagate) {
+        const char** new_envp = malloc(sizeof(*new_envp));
+        if (!new_envp)
+			return -PAL_ERROR_NOMEM;
+        new_envp[0] = NULL;
 
-    toml_table_t* toml_loader = toml_table_in(g_pal_state.manifest_root, "loader");
-    if (!toml_loader)
-        return 0;
-
-    toml_table_t* toml_envs = toml_table_in(toml_loader, "env");
-    if (!toml_envs)
-        return 0;
-
-    ssize_t toml_envs_cnt = toml_table_nkval(toml_envs);
-    if (toml_envs_cnt <= 0) {
-        /* no env entries found in the manifest */
+		*out_envp = new_envp;
         return 0;
     }
 
     size_t orig_envs_cnt = 0;
-    size_t overwrite_cnt = 0;
-    for (const char** orig_env = *envpp; *orig_env; orig_env++, orig_envs_cnt++) {
-        char* orig_env_key_end = strchr(*orig_env, '=');
-        if (!orig_env_key_end)
-            return -PAL_ERROR_INVAL;
+    for (const char** orig_env = envp; *orig_env; orig_env++)
+        orig_envs_cnt++;
 
-        *orig_env_key_end = '\0';
-        toml_raw_t toml_env_raw = toml_raw_in(toml_envs, *orig_env);
-        if (toml_env_raw) {
-            /* found the original-env key in manifest (i.e., loader.env.<key> exists) */
-            overwrite_cnt++;
+    const char** new_envp = calloc(orig_envs_cnt + 1, sizeof(const char*));
+    if (!new_envp)
+        return -PAL_ERROR_NOMEM;
+
+    size_t idx = 0;
+    for (const char** orig_env = envp; *orig_env; orig_env++) {
+        new_envp[idx] = strdup(*orig_env);
+        if (!new_envp[idx]) {
+            return -PAL_ERROR_NOMEM;
         }
-        *orig_env_key_end = '=';
+        idx++;
+    }
+    assert(idx == orig_envs_cnt);
+
+    *out_envp = new_envp;
+    return 0;
+}
+
+/* Function takes original envvars in `envp` and creates a deep copy of these envvars in a new array
+ * `out_envp`, augmented with envvars found in the manifest file (if any).
+ * This function leaks memory on failure (and this is non-trivial to fix), but the assumption is
+ * that its failure finishes the execution of the whole process right away. */
+static int augment_envs_based_on_manifest(bool propagate, const char** envp,
+                                          const char*** out_envp) {
+    int ret;
+
+    toml_table_t* toml_loader = toml_table_in(g_pal_state.manifest_root, "loader");
+    if (!toml_loader)
+        return deep_copy_envs(propagate, envp, out_envp);
+
+    toml_table_t* toml_envs = toml_table_in(toml_loader, "env");
+    if (!toml_envs)
+        return deep_copy_envs(propagate, envp, out_envp);
+
+    ssize_t toml_envs_cnt = toml_table_nkval(toml_envs);
+    if (toml_envs_cnt < 0)
+        return -PAL_ERROR_INVAL;
+
+    ssize_t toml_env_tables_cnt = toml_table_ntab(toml_envs);
+    if (toml_env_tables_cnt < 0)
+        return -PAL_ERROR_INVAL;
+
+    toml_envs_cnt += toml_env_tables_cnt;
+    if (toml_envs_cnt == 0) {
+        /* no env entries found in the manifest */
+        return deep_copy_envs(propagate, envp, out_envp);
     }
 
-    size_t total_envs_cnt = orig_envs_cnt + toml_envs_cnt - overwrite_cnt;
+    size_t orig_envs_cnt = 0;
+    for (const char** orig_env = envp; *orig_env; orig_env++)
+        orig_envs_cnt++;
+
+    /* For simplicity, overapproximate the number of envs by summing up the ones found in the
+     * original envp and the ones found in the manifest. */
+    size_t total_envs_cnt = orig_envs_cnt + toml_envs_cnt;
     const char** new_envp = calloc(total_envs_cnt + 1, sizeof(const char*));
     if (!new_envp)
         return -PAL_ERROR_NOMEM;
@@ -109,46 +220,73 @@ static int insert_envs_from_manifest(const char*** envpp) {
      * go through original envs and populate new_envp with only those that are not overwritten by
      * manifest envs. Then append all manifest envs to new_envp. */
     size_t idx = 0;
-    for (const char** orig_env = *envpp; *orig_env; orig_env++) {
+    for (const char** orig_env = envp; *orig_env; orig_env++) {
         char* orig_env_key_end = strchr(*orig_env, '=');
+        if (!orig_env_key_end)
+            return -PAL_ERROR_INVAL;
 
-        *orig_env_key_end = '\0';
-        toml_raw_t toml_env_raw = toml_raw_in(toml_envs, *orig_env);
-        if (!toml_env_raw) {
-            /* this original env is not found in manifest (i.e., not overwritten) */
-            *orig_env_key_end = '=';
-            new_envp[idx] = malloc_copy(*orig_env, strlen(*orig_env) + 1);
-            if (!new_envp[idx]) {
-                /* don't care about proper memory cleanup since will terminate anyway */
+        char* env_key = alloc_substr(*orig_env, orig_env_key_end - *orig_env);
+        if (!env_key)
+            return -PAL_ERROR_NOMEM;
+
+        bool exists;
+        char* env_val;
+        bool passthrough;
+        ret = get_env_value_from_manifest(toml_envs, env_key, &exists, &env_val, &passthrough);
+        if (ret < 0) {
+            log_error("Invalid environment variable in manifest: '%s'", env_key);
+            return ret;
+        }
+
+        if ((propagate && !exists) || (exists && passthrough)) {
+            new_envp[idx] = strdup(*orig_env);
+            if (!new_envp[idx])
                 return -PAL_ERROR_NOMEM;
-            }
             idx++;
         }
-        *orig_env_key_end = '=';
+
+        free(env_key);
+        free(env_val);
     }
-    assert(idx < total_envs_cnt);
 
     for (ssize_t i = 0; i < toml_envs_cnt; i++) {
         const char* toml_env_key = toml_key_in(toml_envs, i);
         assert(toml_env_key);
-        toml_raw_t toml_env_value_raw = toml_raw_in(toml_envs, toml_env_key);
-        assert(toml_env_value_raw);
 
-        char* toml_env_value = NULL;
-        ret = toml_rtos(toml_env_value_raw, &toml_env_value);
+        bool exists;
+        char* env_val;
+        bool passthrough;
+        ret = get_env_value_from_manifest(toml_envs, toml_env_key, &exists, &env_val, &passthrough);
         if (ret < 0) {
-            /* don't care about proper memory cleanup since will terminate anyway */
-            return -PAL_ERROR_NOMEM;
+            log_error("Invalid environment variable in manifest: '%s'", toml_env_key);
+            return ret;
         }
 
-        char* final_env = alloc_concat3(toml_env_key, strlen(toml_env_key), "=", 1, toml_env_value,
-                                        strlen(toml_env_value));
-        new_envp[idx++] = final_env;
-        free(toml_env_value);
-    }
-    assert(idx == total_envs_cnt);
+        assert(exists);
+        if (propagate && !env_val && !passthrough) {
+            /* this is not a hard-coded envvar and its passthrough == false */
+            log_error("Forbidden combination: 'loader.insecure__use_host_env' /"
+                      " 'loader.env_src_file' specified together with 'env.%s.passthrough = false'"
+                      " in manifest", toml_env_key);
+            return -PAL_ERROR_DENIED;
+        }
 
-    *envpp = new_envp;
+        if (!env_val) {
+            /* this is envvar with passthrough = true, we accounted for it in previous loop */
+            continue;
+        }
+
+        char* final_env = alloc_concat3(toml_env_key, strlen(toml_env_key), "=", 1, env_val,
+                                        strlen(env_val));
+        if (!final_env)
+            return -PAL_ERROR_NOMEM;
+
+        new_envp[idx++] = final_env;
+        free(env_val);
+    }
+    assert(idx <= total_envs_cnt);
+
+    *out_envp = new_envp;
     return 0;
 }
 
@@ -366,6 +504,11 @@ noreturn void pal_main(uint64_t instance_id,       /* current instance id */
         }
     }
 
+    /* we don't modify original `environments` but deep-copy them into `final_environments`,
+     * augmented based on `loader.env.key` manifest options */
+    const char** initial_environments = NULL;
+    const char** final_environments   = NULL;
+
     bool use_host_env;
     ret = toml_bool_in(g_pal_state.manifest_root, "loader.insecure__use_host_env",
                        /*defaultval=*/false, &use_host_env);
@@ -377,15 +520,11 @@ noreturn void pal_main(uint64_t instance_id,       /* current instance id */
     if (use_host_env) {
         /* Warn only in the first process. */
         if (!parent_process) {
-            log_error("Forwarding host environment variables to the app is enabled. Graphene will "
-                      "continue application execution, but this configuration must not be used in "
-                      "production!");
+            log_error("Forwarding host environment variables to the app is enabled. All "
+                      "'passthrough' environment variables in the manifest are ignored. Graphene "
+                      "will continue application execution, but this configuration must not be "
+                      "used in production!");
         }
-    } else {
-        environments = malloc(sizeof(*environments));
-        if (!environments)
-            INIT_FAIL(PAL_ERROR_NOMEM, "Out of memory");
-        environments[0] = NULL;
     }
 
     char* env_src_file = NULL;
@@ -400,18 +539,24 @@ noreturn void pal_main(uint64_t instance_id,       /* current instance id */
     if (env_src_file) {
         /* Insert environment variables from a file. We trust the file contents (this can be
          * achieved using protected or trusted files). */
-        ret = load_cstring_array(env_src_file, &environments);
+        ret = load_cstring_array(env_src_file, &initial_environments);
         if (ret < 0)
             INIT_FAIL(-ret, "Cannot load environment variables from 'loader.env_src_file'");
-        free(env_src_file);
+    } else {
+        /* Environment variables are taken from the host. */
+        initial_environments = environments;
     }
-
 
     // TODO: Envs from file should be able to override ones from the manifest, but current
     // code makes this hard to implement.
-    ret = insert_envs_from_manifest(&environments);
+    ret = augment_envs_based_on_manifest(use_host_env || env_src_file, initial_environments,
+                                         &final_environments);
     if (ret < 0)
-        INIT_FAIL(-ret, "Inserting environment variables from the manifest failed");
+        INIT_FAIL(-ret, "Augmenting environment variables based on the manifest failed");
+
+    if (initial_environments != environments)
+        free(initial_environments);
+    free(env_src_file);
 
     load_libraries();
 
@@ -454,7 +599,7 @@ noreturn void pal_main(uint64_t instance_id,       /* current instance id */
     }
 
     /* Now we will start the execution */
-    start_execution(arguments, environments);
+    start_execution(arguments, final_environments);
 
 out_fail:
     /* We wish we will never reached here */
