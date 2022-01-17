@@ -9,10 +9,13 @@
  * creation.
  */
 
+#include <asm-generic/errno-base.h>
 #include <asm/fcntl.h>
 #include <linux/fs.h>
+#include <linux/limits.h>
 #include <linux/sched.h>
 #include <linux/types.h>
+#include <stdint.h>
 
 #include "api.h"
 #include "crypto.h"
@@ -23,6 +26,7 @@
 #include "pal_linux_defs.h"
 #include "pal_linux_error.h"
 #include "protected-files/protected_files.h"
+#include "protected-files/protected_files_format.h"
 #include "spinlock.h"
 
 /*
@@ -180,8 +184,8 @@ int _DkProcessCreate(PAL_HANDLE* handle, const char** args) {
         goto failed;
 
     /* securely send the wrap key for protected files to child (only if there is one) */
-    char pf_wrap_key_set_char[1];
-    pf_wrap_key_set_char[0] = g_pf_wrap_key_set ? '1' : '0';
+    char pf_wrap_key_set_char[4];
+    snprintf(pf_wrap_key_set_char, sizeof(pf_wrap_key_set_char), "%lu", g_custom_wrap_pf_key_size);
 
     ret = _DkStreamSecureWrite(child->process.ssl_ctx, (uint8_t*)&pf_wrap_key_set_char,
                                sizeof(pf_wrap_key_set_char),
@@ -189,11 +193,28 @@ int _DkProcessCreate(PAL_HANDLE* handle, const char** args) {
     if (ret != sizeof(pf_wrap_key_set_char))
         goto failed;
 
-    if (g_pf_wrap_key_set) {
-        ret = _DkStreamSecureWrite(child->process.ssl_ctx, (uint8_t*)&g_pf_wrap_key,
-                                   sizeof(g_pf_wrap_key),
+    if (g_custom_wrap_pf_key_size > 0) {
+        const size_t item_size = PF_KEY_SIZE + PATH_MAX;
+        char* pf_wrap_key_buf = calloc(item_size, g_custom_wrap_pf_key_size);
+
+        size_t i = 0;
+        pf_key_t src_pfkey;
+        char *src_pfpath;
+        for (; i < g_custom_wrap_pf_key_size; i ++) {
+            int result = set_wrap_pf_key(i, &src_pfkey, &src_pfpath);
+            if (result < 0) {
+                log_debug("Invalid index when access wrap key");
+                return -EACCES;
+            }
+            memcpy(pf_wrap_key_buf + i * item_size, src_pfkey, PF_KEY_SIZE);
+            memcpy(pf_wrap_key_buf + i * item_size + PF_KEY_SIZE, src_pfpath, PATH_MAX);
+        }
+
+        ret = _DkStreamSecureWrite(child->process.ssl_ctx, (uint8_t*)&pf_wrap_key_buf,
+                                   item_size * g_custom_wrap_pf_key_size,
                                    /*is_blocking=*/!child->process.nonblocking);
-        if (ret != sizeof(g_pf_wrap_key))
+        free(pf_wrap_key_buf);
+        if (ret != (int)(item_size * g_custom_wrap_pf_key_size))
             goto failed;
     }
 
@@ -253,23 +274,45 @@ int init_child_process(int parent_stream_fd, PAL_HANDLE* out_parent_handle,
         goto out_error;
 
     /* securely receive the wrap key for protected files from parent (only if there is one) */
-    char pf_wrap_key_set_char[1] = {0};
+    char pf_wrap_key_set_char[4] = {0};
     ret = _DkStreamSecureRead(parent->process.ssl_ctx, (uint8_t*)&pf_wrap_key_set_char,
                               sizeof(pf_wrap_key_set_char),
                               /*is_blocking=*/!parent->process.nonblocking);
     if (ret != sizeof(pf_wrap_key_set_char))
         goto out_error;
 
-    if (pf_wrap_key_set_char[0] == '1') {
-        ret = _DkStreamSecureRead(parent->process.ssl_ctx, (uint8_t*)&g_pf_wrap_key,
-                                  sizeof(g_pf_wrap_key),
+    size_t read_pf_wrap_key_size = atoi(pf_wrap_key_set_char); 
+    if (read_pf_wrap_key_size > 0) {
+        const size_t item_size = PF_KEY_SIZE + PATH_MAX;
+        char* pf_wrap_key_buf = calloc(item_size, read_pf_wrap_key_size);
+        if (!pf_wrap_key_buf) {
+            return -ENOMEM;
+        }
+        ret = _DkStreamSecureRead(parent->process.ssl_ctx, (uint8_t*)&pf_wrap_key_buf,
+                                  item_size * read_pf_wrap_key_size,
                                   /*is_blocking=*/!parent->process.nonblocking);
-        if (ret != sizeof(g_pf_wrap_key)) {
-            g_pf_wrap_key_set = false;
+        if (ret != (int)(item_size * read_pf_wrap_key_size)) {
+            //g_pf_wrap_key_set = false;
+            free(pf_wrap_key_buf);
             goto out_error;
         }
-
-        g_pf_wrap_key_set = true;
+        size_t i = 0;
+        pf_key_t dest_pfkey;
+        char *dest_pfpath = NULL;
+        for (; i < item_size * read_pf_wrap_key_size; i += item_size) {
+            char* pfkey = (char*)pf_wrap_key_buf + i;
+            char* pfpath = (char*)pf_wrap_key_buf + i + PF_KEY_SIZE;
+            size_t idx = get_wrap_pf_key_index(pfpath, &dest_pfkey, &dest_pfpath);
+            if (idx >= PF_WRAP_KEY_MAX_SIZE) {
+                log_debug("init_child_process: pf key buf out of memory");
+                free(pf_wrap_key_buf);
+                goto out_error;
+            }
+            memcpy((uint8_t*)dest_pfkey, (uint8_t*)pfkey, PF_KEY_SIZE);
+            memcpy(dest_pfpath, pfpath, PATH_MAX);
+            g_custom_wrap_pf_key_size += 1;
+        }
+        free(pf_wrap_key_buf);
     }
 
     uint64_t instance_id;

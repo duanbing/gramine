@@ -52,8 +52,9 @@ int _DkAttestationQuote(const void* user_report_data, PAL_NUM user_report_data_s
     return -PAL_ERROR_NOTIMPLEMENTED;
 }
 
-int _DkSetProtectedFilesKey(const char* pf_key_hex) {
+int _DkSetProtectedFilesKey(const char* pf_key_hex, const char* path) {
     __UNUSED(pf_key_hex);
+    __UNUSED(path);
     return -PAL_ERROR_NOTIMPLEMENTED;
 }
 

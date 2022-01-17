@@ -22,6 +22,8 @@
 /*! Size of MAC fields */
 #define PF_MAC_SIZE 16
 
+#define PF_WRAP_KEY_MAX_SIZE 1024
+
 typedef uint8_t pf_iv_t[PF_IV_SIZE];
 typedef uint8_t pf_mac_t[PF_MAC_SIZE];
 typedef uint8_t pf_key_t[PF_KEY_SIZE];
@@ -29,8 +31,12 @@ typedef uint8_t pf_keyid_t[32]; /* key derivation material */
 
 extern pf_key_t g_pf_mrenclave_key;
 extern pf_key_t g_pf_mrsigner_key;
-extern pf_key_t g_pf_wrap_key;
-extern bool g_pf_wrap_key_set;
+//extern pf_key_t g_pf_wrap_key;
+//extern bool g_pf_wrap_key_set;
+extern size_t get_wrap_pf_key_index(const char* path, pf_key_t* pf_key, char** pf_path);
+extern int set_wrap_pf_key(size_t idx, pf_key_t* pf_key, char** pf_path); 
+
+extern size_t g_custom_wrap_pf_key_size;
 
 typedef enum _pf_status_t {
     PF_STATUS_SUCCESS              = 0,

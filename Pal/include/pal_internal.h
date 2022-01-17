@@ -233,7 +233,7 @@ int _DkAttestationReport(const void* user_report_data, PAL_NUM* user_report_data
                          PAL_NUM* report_size);
 int _DkAttestationQuote(const void* user_report_data, PAL_NUM user_report_data_size, void* quote,
                         PAL_NUM* quote_size);
-int _DkSetProtectedFilesKey(const char* pf_key_hex);
+int _DkSetProtectedFilesKey(const char* pf_key_hex, const char* path);
 
 #define INIT_FAIL(exitcode, reason)                                                              \
     do {                                                                                         \

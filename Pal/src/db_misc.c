@@ -52,6 +52,6 @@ int DkAttestationQuote(const void* user_report_data, PAL_NUM user_report_data_si
     return _DkAttestationQuote(user_report_data, user_report_data_size, quote, quote_size);
 }
 
-int DkSetProtectedFilesKey(const char* pf_key_hex) {
-    return _DkSetProtectedFilesKey(pf_key_hex);
+int DkSetProtectedFilesKey(const char* pf_key_hex, const char* path) {
+    return _DkSetProtectedFilesKey(pf_key_hex, path);
 }

@@ -4,6 +4,7 @@
  */
 
 #include <linux/fs.h>
+#include <linux/limits.h>
 
 #include "crypto.h"
 #include "enclave_pf.h"
@@ -11,6 +12,7 @@
 #include "pal_internal.h"
 #include "pal_linux.h"
 #include "pal_linux_error.h"
+#include "protected-files/protected_files.h"
 #include "spinlock.h"
 #include "toml.h"
 #include "toml_utils.h"
@@ -26,8 +28,37 @@ pf_key_t g_pf_mrsigner_key = {0};
 /* Wrap key for protected files, either hard-coded in manifest, provisioned during attestation, or
  * inherited from the parent process. We don't use synchronization on them since they are only set
  * during initialization where Gramine runs single-threaded. */
-pf_key_t g_pf_wrap_key = {0};
-bool g_pf_wrap_key_set = false;
+//bool g_pf_wrap_key_set = false;
+
+struct wrap_pfkey_st {
+    pf_key_t pf_key;
+    char path[PATH_MAX];
+};
+size_t g_custom_wrap_pf_key_size = 0;
+struct wrap_pfkey_st g_custom_pf_key_hex[PF_WRAP_KEY_MAX_SIZE];
+
+size_t get_wrap_pf_key_index(const char* path, pf_key_t* pf_key, char** pf_path) {
+    size_t i;
+    for (i = 0; i < g_custom_wrap_pf_key_size; i ++) {
+        if (0 == strncmp(g_custom_pf_key_hex[i].path, path, PATH_MAX)) {
+            if(pf_key) pf_key = &(g_custom_pf_key_hex[i].pf_key);
+            if(*pf_path) *pf_path = g_custom_pf_key_hex[i].path;
+            return i;
+        }
+    }
+    return g_custom_wrap_pf_key_size;
+}
+
+int set_wrap_pf_key(size_t idx, pf_key_t* pf_key, char** pf_path) {
+    if (idx >= g_custom_wrap_pf_key_size) {
+        return -1;
+    }
+    if (pf_key)
+        pf_key = &(g_custom_pf_key_hex[idx].pf_key);
+    if (*pf_path)
+        *pf_path = g_custom_pf_key_hex[idx].path;
+    return 0;
+}
 
 /*
  * At startup, protected file paths are read from the manifest and the specified files
@@ -625,14 +656,21 @@ int init_protected_files(void) {
         return -PAL_ERROR_INVAL;
     }
 
-    if (protected_files_key_str) {
+    if (protected_files_key_str && false) {
+        // should never come here
         if (strlen(protected_files_key_str) != PF_KEY_SIZE * 2) {
             log_error("Malformed 'sgx.insecure__protected_files_key' value in the manifest");
             free(protected_files_key_str);
             return -PAL_ERROR_INVAL;
         }
 
-        memset(g_pf_wrap_key, 0, sizeof(g_pf_wrap_key));
+        size_t idx = get_wrap_pf_key_index("/", NULL, NULL);
+        if (idx >= PF_WRAP_KEY_MAX_SIZE) {
+            log_error("Too many pf keys");
+            return -PAL_ERROR_NOMEM;
+        }
+        pf_key_t* pf_wrap_key = &g_custom_pf_key_hex[idx].pf_key;
+        memset(*pf_wrap_key, 0, sizeof(*pf_wrap_key));
         for (size_t i = 0; i < strlen(protected_files_key_str); i++) {
             int8_t val = hex2dec(protected_files_key_str[i]);
             if (val < 0) {
@@ -640,11 +678,11 @@ int init_protected_files(void) {
                 free(protected_files_key_str);
                 return -PAL_ERROR_INVAL;
             }
-            g_pf_wrap_key[i / 2] = g_pf_wrap_key[i / 2] * 16 + (uint8_t)val;
+            (*pf_wrap_key)[i / 2] = (*pf_wrap_key)[i / 2] * 16 + (uint8_t)val;
         }
 
         free(protected_files_key_str);
-        g_pf_wrap_key_set = true;
+        //g_pf_wrap_key_set = true;
     }
 
     ret = register_protected_files(PROTECTED_FILE_KEY_WRAP);
@@ -672,13 +710,15 @@ int init_protected_files(void) {
 static int open_protected_file(const char* path, struct protected_file* pf, pf_handle_t handle,
                                uint64_t size, pf_file_mode_t mode, bool create) {
     pf_key_t* pf_key = NULL;
+    size_t idx = PF_WRAP_KEY_MAX_SIZE;
     switch (pf->key_type) {
         case PROTECTED_FILE_KEY_WRAP:
-            if (!g_pf_wrap_key_set) {
+            idx = get_wrap_pf_key_index(path, NULL, NULL);
+            if (idx >= g_custom_wrap_pf_key_size) {
                 log_error("pf_open failed: wrap key was not provided");
                 return -PAL_ERROR_DENIED;
             }
-            pf_key = &g_pf_wrap_key;
+            pf_key = &g_custom_pf_key_hex[idx].pf_key;
             break;
         case PROTECTED_FILE_KEY_MRENCLAVE:
             pf_key = &g_pf_mrenclave_key;
@@ -789,24 +829,31 @@ int unload_protected_file(struct protected_file* pf) {
     return 0;
 }
 
-int set_protected_files_key(const char* pf_key_hex) {
+int set_protected_files_key(const char* pf_key_hex, const char* path) {
     size_t pf_key_hex_len = strlen(pf_key_hex);
     if (pf_key_hex_len != PF_KEY_SIZE * 2) {
         return -PAL_ERROR_INVAL;
     }
 
     pf_lock();
-    memset(g_pf_wrap_key, 0, sizeof(g_pf_wrap_key));
+
+    size_t idx = get_wrap_pf_key_index(path, NULL, NULL);
+    if (idx >= PF_WRAP_KEY_MAX_SIZE) {
+        return -PAL_ERROR_NOMEM;
+    }
+    pf_key_t* pf_wrap_key = &g_custom_pf_key_hex[idx].pf_key;
+    memset(*pf_wrap_key, 0, sizeof(*pf_wrap_key));
     for (size_t i = 0; i < pf_key_hex_len; i++) {
         int8_t val = hex2dec(pf_key_hex[i]);
         if (val < 0) {
-            memset(g_pf_wrap_key, 0, sizeof(g_pf_wrap_key));
+            memset(*pf_wrap_key, 0, sizeof(*pf_wrap_key));
             pf_unlock();
             return -PAL_ERROR_INVAL;
         }
-        g_pf_wrap_key[i / 2] = g_pf_wrap_key[i / 2] * 16 + (uint8_t)val;
+        (*pf_wrap_key)[i / 2] = (*pf_wrap_key)[i / 2] * 16 + (uint8_t)val;
     }
-    g_pf_wrap_key_set = true;
+    //g_pf_wrap_key_set = true;
+    g_custom_wrap_pf_key_size += 1;
     pf_unlock();
 
     return 0;

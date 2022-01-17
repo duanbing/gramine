@@ -628,8 +628,8 @@ int _DkAttestationQuote(const void* user_report_data, PAL_NUM user_report_data_s
     return 0;
 }
 
-int _DkSetProtectedFilesKey(const char* pf_key_hex) {
-    return set_protected_files_key(pf_key_hex);
+int _DkSetProtectedFilesKey(const char* pf_key_hex, const char* path) {
+    return set_protected_files_key(pf_key_hex, path);
 }
 
 /* Rest is moved from old `db_main-x86_64.c`. */

@@ -35,7 +35,23 @@ static size_t g_target_info_size = 0;
 static size_t g_report_size = 0;
 
 #define PF_KEY_HEX_SIZE 32
-static char g_pf_key_hex[PF_KEY_HEX_SIZE] = {0};
+#define PF_KEY_MAX_SIZE 1024
+struct pfkey_st {
+    char pf_key_hex[PF_KEY_HEX_SIZE];
+    struct shim_dentry* dent;
+};
+static struct pfkey_st g_custom_pf_key_hex[PF_KEY_MAX_SIZE];
+static size_t g_custom_pf_key_size = 0;
+
+static size_t get_pf_key_index(const struct shim_dentry* dent) {
+    size_t i;
+    for (i = 0; i < g_custom_pf_key_size; i ++) {
+        if (g_custom_pf_key_hex[i].dent == dent) {
+            return i;
+        }
+    }
+    return g_custom_pf_key_size;
+}
 
 static int init_attestation_struct_sizes(void) {
     if (g_user_report_data_size && g_target_info_size && g_report_size) {
@@ -241,16 +257,21 @@ static int quote_load(struct shim_dentry* dent, char** out_data, size_t* out_siz
 }
 
 static int pfkey_load(struct shim_dentry* dent, char** out_data, size_t* out_size) {
-    __UNUSED(dent);
-
-    size_t size = sizeof(g_pf_key_hex);
-    char* pf_key_hex = malloc(size);
+    
+    size_t idx = get_pf_key_index(dent);
+    if (idx >= g_custom_pf_key_size) {
+        log_debug("can't find the keys when loading pfkey");
+        return -EACCES;
+    }
+    char* cur_pf_key_hex = g_custom_pf_key_hex[idx].pf_key_hex;
+    
+    char* pf_key_hex = malloc(PF_KEY_HEX_SIZE);
     if (!pf_key_hex)
         return -ENOMEM;
 
-    memcpy(pf_key_hex, &g_pf_key_hex, size);
+    memcpy(pf_key_hex, cur_pf_key_hex, PF_KEY_HEX_SIZE);
     *out_data = pf_key_hex;
-    *out_size = size;
+    *out_size = PF_KEY_HEX_SIZE;
     return 0;
 }
 
@@ -264,22 +285,36 @@ static int pfkey_load(struct shim_dentry* dent, char** out_data, size_t* out_siz
  * The PF key must be a 32-char null-terminated AES-GCM encryption key in hex format.
  */
 static int pfkey_save(struct shim_dentry* dent, const char* data, size_t size) {
-    __UNUSED(dent);
+    size_t idx = get_pf_key_index(dent);
+    if (idx >= PF_KEY_MAX_SIZE) {
+        log_debug("too much custom keys for protected files");
+        return -ENOMEM;
+    }
 
-    if (size != sizeof(g_pf_key_hex)) {
+    char *pf_key_hex = g_custom_pf_key_hex[idx].pf_key_hex;
+    if (size != PF_KEY_HEX_SIZE) {
         log_debug("/dev/attestation/protected_files_key: invalid length");
         return -EACCES;
     }
 
     /* Build a null-terminated string and pass it to `DkSetProtectedFilesKey`. */
-    char buffer[sizeof(g_pf_key_hex) + 1];
-    memcpy(buffer, data, sizeof(g_pf_key_hex));
-    buffer[sizeof(g_pf_key_hex)] = '\0';
-    int ret = DkSetProtectedFilesKey(buffer);
+    char buffer[PF_KEY_HEX_SIZE + 1];
+    memcpy(buffer, data, PF_KEY_HEX_SIZE);
+    buffer[PF_KEY_HEX_SIZE] = '\0';
+
+    char* path_buf;
+    int status = dentry_abs_path(dent, &path_buf, NULL);
+    if (status < 0) {
+        log_debug("read abs path failed");
+        return status;
+    }
+    int ret = DkSetProtectedFilesKey(buffer, path_buf);
     if (ret < 0)
         return -EACCES;
 
-    memcpy(g_pf_key_hex, data, sizeof(g_pf_key_hex));
+    memcpy(pf_key_hex, data, PF_KEY_HEX_SIZE);
+    g_custom_pf_key_size += 1;
+    free(path_buf);
     return 0;
 }
 

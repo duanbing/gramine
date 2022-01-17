@@ -68,7 +68,7 @@ void pf_lock(void);
 void pf_unlock(void);
 
 /* Set new wrap key for protected files (e.g., provisioned by remote user) */
-int set_protected_files_key(const char* pf_key_hex);
+int set_protected_files_key(const char* pf_key_hex, const char* path);
 
 /* Return a registered PF that matches specified path
    (or the path is contained in a registered PF directory) */

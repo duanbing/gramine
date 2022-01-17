@@ -759,8 +759,9 @@ int DkAttestationQuote(const void* user_report_data, PAL_NUM user_report_data_si
  *
  * \param[in]     pf_key_hex       Wrap key for protected files. Must be a 32-char null-terminated
  *                                 hex string in case of SGX PAL (AES-GCM encryption key).
+ * \param[in]     path             the path attached to pf_key_hex
  */
-int DkSetProtectedFilesKey(const char* pf_key_hex);
+int DkSetProtectedFilesKey(const char* pf_key_hex, const char* path);
 
 #ifdef __GNUC__
 #define symbol_version_default(real, name, version) \
