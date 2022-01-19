@@ -716,6 +716,7 @@ static int open_protected_file(const char* path, struct protected_file* pf, pf_h
             idx = get_wrap_pf_key_index(path, NULL, NULL);
             if (idx >= g_custom_wrap_pf_key_size) {
                 log_error("pf_open failed: wrap key was not provided");
+                // TODO  find the key from parent directory until root.
                 return -PAL_ERROR_DENIED;
             }
             pf_key = &g_custom_pf_key_hex[idx].pf_key;
